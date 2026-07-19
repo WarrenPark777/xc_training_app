@@ -530,10 +530,15 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     final now = DateTime.now();
-    final workouts = await _sync.safeRead(HealthDataType.WORKOUT, last, now);
+    // What the next sync would upload: workouts in the reconcile window that
+    // the local record doesn't yet mark as on the server (matches sync()).
+    final pending = await _sync.pendingWorkoutCount(
+      now.subtract(historyWindow),
+      now,
+    );
     if (!mounted) return;
     setState(() {
-      _pendingSamples = workouts.length;
+      _pendingSamples = pending;
       _lastSyncAt = last!.toLocal();
     });
   }
@@ -1551,7 +1556,7 @@ class _HomeScreenState extends State<HomeScreen> {
         content: Text(
           'This deletes ALL data uploaded for your account on the server '
           'and resets local sync state. The next Sync re-uploads the full '
-          '${firstSyncWindow.inHours}-hour window and all saved routes.',
+          '${historyWindow.inDays}-day window and all saved routes.',
         ),
         actions: [
           TextButton(
@@ -1601,15 +1606,17 @@ class _HomeScreenState extends State<HomeScreen> {
         });
         return;
       }
-      // All sync state (sample watermark, route dedup) lives on the server
-      // and was just deleted with the data — nothing local to clear.
+      // The server owns route dedup and the sample watermark; the only local
+      // state is the uploaded-workout set (reconciliation), cleared here so the
+      // next Sync re-reconciles the whole window from scratch.
+      await _sync.clearUploadedWorkouts();
       if (!mounted) return;
       setState(() {
         _uploading = false;
         _status =
             'Server data deleted: ${resp.body}\nLocal sync state '
             'cleared — next Sync re-uploads the full '
-            '${firstSyncWindow.inHours}-hour window + all routes.';
+            '${historyWindow.inDays}-day window + all routes.';
       });
     } catch (e) {
       if (!mounted) return;
@@ -2280,15 +2287,15 @@ class _HomeScreenState extends State<HomeScreen> {
       statusIcon = Icons.cloud_off;
       statusLine =
           'Nothing uploaded yet — tap Sync to upload your last '
-          '${firstSyncWindow.inHours} hours.';
+          '${historyWindow.inDays} days.';
     } else if (pending == 0) {
       statusIcon = Icons.cloud_done;
       statusLine = 'All data uploaded.';
     } else {
       statusIcon = Icons.cloud_upload;
       statusLine = pending == 1
-          ? '1 new workout since your last sync.'
-          : '$pending new workouts since your last sync.';
+          ? '1 workout not yet uploaded — tap Sync.'
+          : '$pending workouts not yet uploaded — tap Sync.';
     }
 
     return SingleChildScrollView(

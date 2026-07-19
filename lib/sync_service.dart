@@ -11,6 +11,7 @@ import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:health/health.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'auth_service.dart';
 
@@ -39,31 +40,18 @@ const int athleteId = 1;
 // it. Must match `version` in pubspec.yaml — bump both together.
 const String clientVersion = '1.0.0+1';
 
-// When the server has no data for this athlete yet, the first sync uploads
-// this much history. Afterwards each sync asks the server for the newest
-// sample it has (GET /me/last-sample-time) and uploads from there — the
-// server is the single source of truth, so reinstalls and second devices
-// resume where the data actually ends.
-const Duration firstSyncWindow = Duration(hours: 24);
-
-// How far back the Runs tab, route uploads, and the debug export look.
-// Deliberately wider than the first-sync upload window — showing a month of
-// history is useful even though uploads default to the last day.
+// How far back every sync reconciles, and how far back the Runs tab, route
+// uploads, and the debug export look. Each sync compares the workouts in this
+// window against what the server already has and uploads the difference — so a
+// workout that lands with a backdated timestamp (e.g. a Garmin activity that
+// syncs in days late) still gets picked up, which a watermark-forward sync
+// would miss once its newest-sample mark moved past the workout's date.
 const Duration historyWindow = Duration(days: 30);
 
 // The app uploads workout data only: continuous streams (HR, steps, distance,
 // calories) are read solely within this padding around each recorded workout.
 // The padding keeps warm-up / cool-down context for HR-recovery analysis.
 const Duration workoutPadding = Duration(minutes: 10);
-
-// Each sync re-reads this much history before the server watermark to catch
-// late-arriving Health Connect samples. The watermark is a single global max
-// across all streams, so live HR pins it near "now"; but Fitbit derives resting
-// HR, HRV, and sleep from overnight data and delivers them hours late, with a
-// dateTo well behind that global max. A 1h overlap missed them — use 24h so a
-// late-delivered sample still falls inside the next sync's window. The server's
-// UUID upsert dedup makes the wider re-query harmless.
-const Duration watermarkOverlap = Duration(hours: 24);
 
 // On iOS the health plugin maps several Android-only names onto a single
 // HKWorkoutActivityType (RUNNING_TREADMILL → .running, ROCK_CLIMBING →
@@ -169,6 +157,40 @@ class SyncService {
     return t == null ? null : DateTime.parse(t as String).toLocal();
   }
 
+  // Local memory of which workout UUIDs the server already has, so a sync only
+  // re-reads and re-uploads the *missing* ones (see buildSyncPayload). The
+  // server stays the source of truth: this set is dropped whenever the server
+  // reports no data (GET /me/last-sample-time == null), so a wipe or a fresh
+  // athlete safely re-reconciles the whole window. Being wrong can only cause a
+  // re-upload, which the server's composite-key upsert dedups — never a gap.
+  static const String _uploadedWorkoutsPrefsKey = 'uploaded_workout_uuids';
+
+  Future<Set<String>> _loadUploadedWorkouts() async {
+    final prefs = await SharedPreferences.getInstance();
+    return (prefs.getStringList(_uploadedWorkoutsPrefsKey) ?? const <String>[])
+        .toSet();
+  }
+
+  Future<void> _saveUploadedWorkouts(Set<String> uuids) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(_uploadedWorkoutsPrefsKey, uuids.toList());
+  }
+
+  /// Forgets which workouts have been uploaded, forcing the next sync to
+  /// re-reconcile the whole window. Called after a server data reset.
+  Future<void> clearUploadedWorkouts() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_uploadedWorkoutsPrefsKey);
+  }
+
+  /// How many workouts in [start, end] are not yet on the server — the count
+  /// the next sync would upload. Powers the home screen's "pending" indicator.
+  Future<int> pendingWorkoutCount(DateTime start, DateTime end) async {
+    final workouts = await safeRead(HealthDataType.WORKOUT, start, end);
+    final uploaded = await _loadUploadedWorkouts();
+    return workouts.where((w) => !uploaded.contains(w.uuid)).length;
+  }
+
   Future<List<HealthDataPoint>> safeRead(
     HealthDataType t,
     DateTime start,
@@ -239,15 +261,34 @@ class SyncService {
   /// getHealthDataFromTypes call makes the health plugin serialize the whole
   /// result across the method channel in one allocation, and a full window of
   /// ~165k HR samples OOMs the Java heap.
-  Future<({Map<String, dynamic> payload, int totalSamples})> buildSyncPayload(
+  Future<
+    ({
+      Map<String, dynamic> payload,
+      int totalSamples,
+      Set<String> windowWorkoutUuids,
+    })
+  >
+  buildSyncPayload(
     DateTime windowStart,
     DateTime now, {
     String labelSuffix = '',
+    Set<String> skipWorkoutUuids = const {},
     void Function(String status)? onProgress,
   }) async {
     // Workouts use the package's special WORKOUT path (it aggregates
     // distance/calories/steps from related records). Separate read.
-    final workouts = await safeRead(HealthDataType.WORKOUT, windowStart, now);
+    final allWorkouts = await safeRead(HealthDataType.WORKOUT, windowStart, now);
+    final windowWorkoutUuids = {for (final w in allWorkouts) w.uuid};
+
+    // Reconciliation: skip workouts the server already has (tracked locally by
+    // the caller) so we don't re-read their heavy HR/step samples every sync.
+    // What's left is what the server is missing — including backdated imports
+    // a watermark-forward sync would never revisit.
+    final workouts = skipWorkoutUuids.isEmpty
+        ? allWorkouts
+        : allWorkouts
+              .where((w) => !skipWorkoutUuids.contains(w.uuid))
+              .toList();
 
     // Padded, merged time ranges around the recorded workouts — the only
     // ranges the continuous streams are read from. Merging keeps overlapping
@@ -328,14 +369,22 @@ class SyncService {
       totalSamples += samples.length;
     }
 
-    return (payload: payload, totalSamples: totalSamples);
+    return (
+      payload: payload,
+      totalSamples: totalSamples,
+      windowWorkoutUuids: windowWorkoutUuids,
+    );
   }
 
-  /// The full sync: watermark → payload build → POST /workouts → route
-  /// upload. [backfill] (debug) ignores the server watermark and uploads the
-  /// full [historyWindow]; safe to repeat — the server's composite-key upsert
-  /// dedups everything, and the payload carries "backfill": true so the
-  /// server can tell the overlap is deliberate.
+  /// The full sync: reconcile → payload build → POST /workouts → route upload.
+  /// Reconciles the whole [historyWindow] rather than only uploading forward
+  /// from the server's newest sample: it reads every workout in the window,
+  /// skips the ones a local record says the server already has, and uploads
+  /// the rest. This catches backdated workouts (a Garmin run that syncs in
+  /// late) that a watermark-forward sync would step over. [backfill] (debug)
+  /// ignores the local record and re-sends the whole window; safe to repeat —
+  /// the server's composite-key upsert dedups, and the payload carries
+  /// "backfill": true so the server knows the overlap is deliberate.
   ///
   /// Never throws: every outcome (including a 401, which also invalidates
   /// the token) comes back as a [SyncResult] whose message is ready to show.
@@ -352,42 +401,48 @@ class SyncService {
         'Check it is running and on the same network, then re-tap Sync.',
       );
     }
-    onProgress?.call('Reading data from Health Connect...');
 
     try {
       final now = DateTime.now();
-      final DateTime windowStart;
-      final String windowLabel;
+      final windowStart = now.subtract(historyWindow);
+
+      // The server is the source of truth for what it already has. When it
+      // reports data we trust the local record of uploaded workouts and skip
+      // them; when it reports nothing (first sync, or right after a data reset)
+      // that record is stale, so drop it and re-send the whole window. A
+      // backfill always re-sends.
+      Set<String> alreadyUploaded;
       if (backfill) {
-        windowStart = now.subtract(historyWindow);
-        windowLabel = 'backfill (${historyWindow.inDays} days)';
+        alreadyUploaded = const {};
       } else {
         onProgress?.call('Checking what the server already has...');
         final serverWatermark = await fetchServerWatermark();
-        onProgress?.call('Reading data from Health Connect...');
-        windowStart = serverWatermark != null
-            ? serverWatermark.subtract(watermarkOverlap)
-            : now.subtract(firstSyncWindow);
-        final windowDays = now.difference(windowStart).inMinutes / (60 * 24);
-        windowLabel = serverWatermark != null
-            ? 'since last sync (${windowDays.toStringAsFixed(1)} days)'
-            : 'full ${firstSyncWindow.inHours}-hour window (first sync)';
+        if (serverWatermark == null) {
+          await clearUploadedWorkouts();
+          alreadyUploaded = const {};
+        } else {
+          alreadyUploaded = await _loadUploadedWorkouts();
+        }
       }
 
+      onProgress?.call('Reading data from Health Connect...');
       final built = await buildSyncPayload(
         windowStart,
         now,
+        skipWorkoutUuids: alreadyUploaded,
         onProgress: onProgress,
       );
       final payload = built.payload;
       if (backfill) payload['backfill'] = true;
       final totalSamples = built.totalSamples;
-      final workoutCount = (payload['workouts'] as List).length;
+      final newWorkoutCount = (payload['workouts'] as List).length;
+      final alreadyOnServer =
+          built.windowWorkoutUuids.length - newWorkoutCount;
 
       final bodyBytes = utf8.encode(jsonEncode(payload));
       final sizeMB = (bodyBytes.length / 1024 / 1024).toStringAsFixed(2);
       onProgress?.call(
-        'Uploading $workoutCount workouts + $totalSamples samples ($sizeMB MB)...',
+        'Uploading $newWorkoutCount new workouts + $totalSamples samples ($sizeMB MB)...',
       );
 
       final response = await http
@@ -399,8 +454,13 @@ class SyncService {
           .timeout(const Duration(seconds: 120));
 
       final ok = response.statusCode >= 200 && response.statusCode < 300;
-      // No watermark to persist — the server derives it from the data it
-      // just ingested, and the next sync asks for it again.
+      if (ok) {
+        // Everything in the window is now on the server — the skipped ones were
+        // already there, the new ones we just sent. Remember the full set so
+        // the next sync skips their samples; keyed to the window, so it prunes
+        // itself as workouts age past the horizon.
+        await _saveUploadedWorkouts(built.windowWorkoutUuids);
+      }
 
       // 401 → token rejected. Drop it so the next sync attempt forces
       // sign-in, and show the auth card again instead of a noisy error.
@@ -414,14 +474,11 @@ class SyncService {
 
       // Also upload any GPS routes other apps attached to their workouts
       // (Fitbit / Pixel Watch / Apple Watch runs). Independent of the health
-      // upload above — see SERVER_SCHEMA.md "Route tracks".
-      //
-      // Deliberately NOT the incremental sample window: the watermark rides
-      // the continuous HR stream, so a route that wasn't readable during the
-      // sync right after its run (route permission granted later, Watch
-      // delivered the route late) would fall behind the watermark and never
-      // be scanned again. Routes are few, so always scan the full history
-      // window — dedup against the server's route list keeps it idempotent.
+      // upload above — see SERVER_SCHEMA.md "Route tracks". Like the workout
+      // reconcile, this scans the full history window and dedups against the
+      // server's route list, so a route that only became readable later (route
+      // permission granted after the run, or the Watch delivered it late) is
+      // still caught on a subsequent sync.
       onProgress?.call('Uploading workout routes...');
       final hcRoutes = await uploadRoutes(now.subtract(historyWindow), now);
       if (hcRoutes.unauthorized) {
@@ -444,9 +501,10 @@ class SyncService {
       if (ok) {
         return SyncResult(
           SyncStatus.ok,
-          'Synced $sizeMB MB ($windowLabel): $workoutCount workouts, '
-          '$totalSamples samples. Server: ${response.statusCode}.'
-          '$routeMsg$consentMsg',
+          'Synced $sizeMB MB (last ${historyWindow.inDays} days): '
+          '$newWorkoutCount new workout(s) uploaded, '
+          '$alreadyOnServer already on server, $totalSamples samples. '
+          'Server: ${response.statusCode}.$routeMsg$consentMsg',
         );
       }
       return SyncResult(

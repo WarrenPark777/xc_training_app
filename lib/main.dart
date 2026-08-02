@@ -21,6 +21,7 @@ import 'background_sync.dart'
         scheduleAndroidSync,
         workManagerCallbackDispatcher;
 import 'sync_service.dart';
+import 'training_week.dart';
 
 // Google Cloud Console OAuth 2.0 **web** client ID (the audience the server
 // validates ID tokens against). Set via --dart-define-from-file=config/dev.json
@@ -138,6 +139,11 @@ class _HcRun {
     }
     return 'OTHER';
   }
+
+  // Whether this counts toward training volume. Walks and rides are recorded
+  // by the same apps but aren't XC mileage. Single source of truth for the
+  // weekly totals and the "counts" cue on run tiles.
+  bool get isRun => activityType.contains('RUN');
 
   double? get distanceMeters {
     double? best;
@@ -576,6 +582,14 @@ class _HomeScreenState extends State<HomeScreen> {
     final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
     final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
     return h > 0 ? '$h:$m:$s' : '$m:$s';
+  }
+
+  // Weekly totals as '3h 30m' / '22m'. A clock format would be ambiguous
+  // here — a 22-minute week reads as 22 hours next to "miles" and "runs".
+  String _fmtWeekTime(Duration d) {
+    final h = d.inHours;
+    final m = d.inMinutes.remainder(60);
+    return h > 0 ? '${h}h ${m}m' : '${m}m';
   }
 
   Future<void> _signInWithGoogle() async {
@@ -1071,61 +1085,50 @@ class _HomeScreenState extends State<HomeScreen> {
     // access, automatic-upload choice).
     if (!_onboarded) return _buildOnboarding(theme);
 
-    // The team doesn't record runs in-app, so release builds are Home + Runs
-    // (workouts other apps wrote to Health Connect). Record and Debug tabs
-    // exist only in debug builds, for development/testing.
-    if (!kDebugMode) {
-      final index = _pageIndex.clamp(0, 1);
-      return Scaffold(
-        appBar: AppBar(
-          title: Text(index == 1 ? 'My Runs' : 'Chadwick XC Training'),
-          centerTitle: true,
+    // The team doesn't record runs in-app, so release builds are Training +
+    // Runs (workouts other apps wrote to Health Connect) + Settings. The Debug
+    // tools tab exists only in debug builds.
+    final tabs = <({String title, IconData icon, IconData selected})>[
+      (
+        title: 'Training',
+        icon: Icons.insights_outlined,
+        selected: Icons.insights,
+      ),
+      (
+        title: 'Runs',
+        icon: Icons.directions_run_outlined,
+        selected: Icons.directions_run,
+      ),
+      (
+        title: 'Settings',
+        icon: Icons.settings_outlined,
+        selected: Icons.settings,
+      ),
+      if (kDebugMode)
+        (
+          title: 'Debug',
+          icon: Icons.bug_report_outlined,
+          selected: Icons.bug_report,
         ),
-        body: index == 1 ? _buildHcRunsPage(theme) : _buildHomePage(theme),
-        bottomNavigationBar: NavigationBar(
-          selectedIndex: index,
-          onDestinationSelected: (i) {
-            setState(() {
-              _pageIndex = i;
-              if (i == 1) _hcRunsFuture = _loadHcRuns(); // refresh on open
-            });
-          },
-          destinations: const [
-            NavigationDestination(
-              icon: Icon(Icons.home_outlined),
-              selectedIcon: Icon(Icons.home),
-              label: 'Home',
-            ),
-            NavigationDestination(
-              icon: Icon(Icons.directions_run_outlined),
-              selectedIcon: Icon(Icons.directions_run),
-              label: 'Runs',
-            ),
-          ],
-        ),
-      );
-    }
-
-    // Debug builds: Home + Runs + Debug tools.
-    final titles = <String>['Chadwick XC Training', 'My Runs', 'Debug Tools'];
-    final index = _pageIndex.clamp(0, titles.length - 1);
+    ];
+    const settingsIndex = 2;
+    final index = _pageIndex.clamp(0, tabs.length - 1);
 
     // Build only the active page — building all of them every frame would
     // re-run the Runs loaders on every setState.
-    final Widget body;
-    switch (index) {
-      case 0:
-        body = _buildHomePage(theme);
-        break;
-      case 1:
-        body = _buildHcRunsPage(theme);
-        break;
-      default:
-        body = _buildDebugPage(theme);
-    }
+    final Widget body = switch (index) {
+      0 => _buildTrainingPage(theme),
+      1 => _buildHcRunsPage(theme),
+      settingsIndex => _buildSettingsPage(theme),
+      _ => _buildDebugPage(theme),
+    };
 
     return Scaffold(
-      appBar: AppBar(title: Text(titles[index]), centerTitle: true),
+      appBar: AppBar(
+        title: Text(tabs[index].title),
+        centerTitle: true,
+        actions: [_uploadChip(theme, settingsIndex)],
+      ),
       body: body,
       bottomNavigationBar: NavigationBar(
         selectedIndex: index,
@@ -1135,22 +1138,13 @@ class _HomeScreenState extends State<HomeScreen> {
             if (i == 1) _hcRunsFuture = _loadHcRuns(); // refresh on open
           });
         },
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.home_outlined),
-            selectedIcon: Icon(Icons.home),
-            label: 'Home',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.directions_run_outlined),
-            selectedIcon: Icon(Icons.directions_run),
-            label: 'Runs',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.bug_report_outlined),
-            selectedIcon: Icon(Icons.bug_report),
-            label: 'Debug',
-          ),
+        destinations: [
+          for (final t in tabs)
+            NavigationDestination(
+              icon: Icon(t.icon),
+              selectedIcon: Icon(t.selected),
+              label: t.title,
+            ),
         ],
       ),
     );
@@ -1502,28 +1496,38 @@ class _HomeScreenState extends State<HomeScreen> {
         return ListView.separated(
           itemCount: runs.length,
           separatorBuilder: (_, _) => const Divider(height: 1),
-          itemBuilder: (context, i) {
-            final r = runs[i];
-            final dist = r.distanceMeters;
-            final parts = <String>[
-              if (dist != null)
-                '${(dist / _metersPerMile).toStringAsFixed(2)} mi',
-              _fmtDuration(r.duration),
-              r.sources.map(_prettySource).join(' + '),
-            ];
-            return ListTile(
-              leading: Icon(_activityIcon(r.activityType)),
-              title: Text(
-                '${_prettyActivity(r.activityType)} · '
-                '${_fmtRunDate(r.start.toUtc())}',
-              ),
-              subtitle: Text(parts.join(' · ')),
-              trailing: const Icon(Icons.chevron_right),
-              onTap: () => _openHcRun(r),
-            );
-          },
+          itemBuilder: (context, i) => _runTile(runs[i]),
         );
       },
+    );
+  }
+
+  // One run in a list — shared by the Runs tab and the Training tab's recent
+  // runs. Tapping opens the detail page.
+  Widget _runTile(_HcRun r) {
+    final miles = r.miles;
+    final parts = <String>[
+      if (miles != null) '${miles.toStringAsFixed(2)} mi',
+      _fmtDuration(r.duration),
+      if (miles != null && miles > 0) _fmtPace(r.duration, miles),
+      r.sources.map(_prettySource).join(' + '),
+    ];
+    final theme = Theme.of(context);
+    return ListTile(
+      // Tinted when the activity counts toward weekly run mileage — the cue
+      // that explains why a listed activity may not be in the total.
+      leading: Icon(
+        _activityIcon(r.activityType),
+        color: r.isRun
+            ? theme.colorScheme.primary
+            : theme.colorScheme.onSurfaceVariant,
+      ),
+      title: Text(
+        '${_prettyActivity(r.activityType)} · ${_fmtRunDate(r.start.toUtc())}',
+      ),
+      subtitle: Text(parts.join(' · ')),
+      trailing: const Icon(Icons.chevron_right),
+      onTap: () => _openHcRun(r),
     );
   }
 
@@ -1654,38 +1658,254 @@ class _HomeScreenState extends State<HomeScreen> {
     return '${months[d.month - 1]} ${d.day}, ${d.year}  $h:$min $ampm';
   }
 
-  // Signed-in home: upload status front and center. The Sync button appears
-  // only when there is data the server doesn't have yet.
-  Widget _buildHomePage(ThemeData theme) {
+  // Upload state, rendered both as the app-bar chip and on the Settings tab.
+  // Computed in one place so the two can't disagree.
+  ({IconData icon, String line}) get _uploadStatus {
     final pending = _pendingSamples;
-    final behind = pending != null && pending != 0;
-
-    final String statusLine;
-    final IconData statusIcon;
     if (_uploading) {
-      statusIcon = Icons.cloud_upload;
-      statusLine = _status; // live progress from the sync
-    } else if (pending == null) {
-      statusIcon = Icons.cloud_queue;
-      statusLine = 'Checking for new data…';
-    } else if (pending == -2) {
-      statusIcon = Icons.cloud_off;
-      statusLine = 'Could not reach the server — tap Sync to retry.';
-    } else if (pending == -1) {
-      statusIcon = Icons.cloud_off;
-      statusLine =
-          'Nothing uploaded yet — tap Sync to upload your last '
-          '${historyWindow.inDays} days.';
-    } else if (pending == 0) {
-      statusIcon = Icons.cloud_done;
-      statusLine = 'All data uploaded.';
-    } else {
-      statusIcon = Icons.cloud_upload;
-      statusLine = pending == 1
-          ? '1 workout not yet uploaded — tap Sync.'
-          : '$pending workouts not yet uploaded — tap Sync.';
+      return (icon: Icons.cloud_upload, line: _status); // live sync progress
     }
+    if (pending == null) {
+      return (icon: Icons.cloud_queue, line: 'Checking for new data…');
+    }
+    if (pending == -2) {
+      return (
+        icon: Icons.cloud_off,
+        line: 'Could not reach the server — tap Sync to retry.',
+      );
+    }
+    if (pending == -1) {
+      return (
+        icon: Icons.cloud_off,
+        line:
+            'Nothing uploaded yet — tap Sync to upload your last '
+            '${historyWindow.inDays} days.',
+      );
+    }
+    if (pending == 0) {
+      return (icon: Icons.cloud_done, line: 'All data uploaded.');
+    }
+    return (
+      icon: Icons.cloud_upload,
+      line: pending == 1
+          ? '1 workout not yet uploaded — tap Sync.'
+          : '$pending workouts not yet uploaded — tap Sync.',
+    );
+  }
 
+  // True when the server is missing data (including "never synced" and
+  // "unreachable") — gates the Sync button.
+  bool get _syncBehind => _pendingSamples != null && _pendingSamples != 0;
+
+  // Compact upload indicator in the app bar. Uploading is plumbing, so it gets
+  // an icon here instead of a card on the main screen; tapping opens Settings,
+  // where the full status line and the Sync button live.
+  Widget _uploadChip(ThemeData theme, int settingsIndex) {
+    final status = _uploadStatus;
+    final busy = _uploading || _pendingSamples == null;
+    return IconButton(
+      tooltip: status.line,
+      onPressed: () => setState(() => _pageIndex = settingsIndex),
+      icon: busy
+          ? const SizedBox(
+              width: 18,
+              height: 18,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            )
+          : Icon(
+              status.icon,
+              color: _pendingSamples == -2 ? theme.colorScheme.error : null,
+            ),
+    );
+  }
+
+  // Signed-in home: what the athlete has actually run — this week's volume,
+  // the four-week trend, and the latest runs. Everything here is computed from
+  // Health Connect / HealthKit on the phone, so it works offline.
+  Widget _buildTrainingPage(ThemeData theme) {
+    return FutureBuilder<List<_HcRun>>(
+      future: _hcRunsFuture ??= _loadHcRuns(),
+      builder: (context, snap) {
+        if (snap.connectionState != ConnectionState.done) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        final runs = snap.data ?? [];
+        final onlyRuns = [
+          for (final r in runs)
+            if (r.isRun) r,
+        ];
+        final weeks = weeklyTotals([
+          for (final r in onlyRuns)
+            RunSummary(start: r.start, miles: r.miles, duration: r.duration),
+        ], DateTime.now());
+        final thisWeek = weeks.last;
+        final lastWeek = weeks[weeks.length - 2];
+
+        return RefreshIndicator(
+          onRefresh: () async {
+            final future = _loadHcRuns();
+            setState(() => _hcRunsFuture = future);
+            await future;
+          },
+          child: ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'This week',
+                        style: theme.textTheme.titleMedium?.copyWith(
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      Row(
+                        children: [
+                          // "run miles", not "miles" — the list below shows all
+                          // activity, but only runs count toward volume.
+                          _bigMetric(
+                            theme,
+                            thisWeek.miles.toStringAsFixed(1),
+                            'run miles',
+                          ),
+                          _bigMetric(theme, '${thisWeek.runs}', 'runs'),
+                          _bigMetric(
+                            theme,
+                            _fmtWeekTime(thisWeek.time),
+                            'time',
+                          ),
+                        ],
+                      ),
+                      if (thisWeek.miles > 0 || lastWeek.miles > 0) ...[
+                        const SizedBox(height: 12),
+                        _weekDelta(theme, thisWeek.miles - lastWeek.miles),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 16, 12, 12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.only(left: 8),
+                        child: Text(
+                          'Weekly mileage',
+                          style: theme.textTheme.titleMedium?.copyWith(
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      WeeklyMileageChart(weeks),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 20),
+              if (runs.isEmpty)
+                Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Text(
+                    'No workouts found in the last ${historyWindow.inDays} '
+                    'days. Runs recorded by Fitbit, Strava, and other apps '
+                    'show up here once they sync.',
+                    textAlign: TextAlign.center,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                )
+              else ...[
+                Padding(
+                  padding: const EdgeInsets.only(left: 4, bottom: 4),
+                  child: Text(
+                    'Recent activity',
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                for (final r in runs.take(3)) _runTile(r),
+                if (runs.length > 3)
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton(
+                      onPressed: () => setState(() => _pageIndex = 1),
+                      child: Text('See all ${runs.length} activities'),
+                    ),
+                  ),
+              ],
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  // One of the three big numbers on the "This week" card.
+  Widget _bigMetric(ThemeData theme, String value, String label) => Expanded(
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          value,
+          style: theme.textTheme.headlineMedium?.copyWith(
+            fontWeight: FontWeight.w600,
+            color: theme.colorScheme.primary,
+          ),
+        ),
+        Text(
+          label,
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+      ],
+    ),
+  );
+
+  // "▲ 2.1 mi vs last week" — the comparison a runner actually looks for.
+  Widget _weekDelta(ThemeData theme, double deltaMiles) {
+    final rounded = double.parse(deltaMiles.toStringAsFixed(1));
+    if (rounded == 0) {
+      return Text(
+        'Even with last week',
+        style: theme.textTheme.bodySmall?.copyWith(
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
+      );
+    }
+    final up = rounded > 0;
+    return Row(
+      children: [
+        Icon(
+          up ? Icons.arrow_upward : Icons.arrow_downward,
+          size: 16,
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
+        const SizedBox(width: 4),
+        Text(
+          '${rounded.abs().toStringAsFixed(1)} mi vs last week',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+      ],
+    );
+  }
+
+  // Account, upload status, and the automatic-upload choice.
+  Widget _buildSettingsPage(ThemeData theme) {
+    final status = _uploadStatus;
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24.0),
       child: Column(
@@ -1701,14 +1921,14 @@ class _HomeScreenState extends State<HomeScreen> {
                 children: [
                   Row(
                     children: [
-                      if (_uploading || pending == null)
+                      if (_uploading || _pendingSamples == null)
                         const SizedBox(
                           width: 20,
                           height: 20,
                           child: CircularProgressIndicator(strokeWidth: 2),
                         )
                       else
-                        Icon(statusIcon, color: theme.colorScheme.primary),
+                        Icon(status.icon, color: theme.colorScheme.primary),
                       const SizedBox(width: 12),
                       Text(
                         'Upload status',
@@ -1719,7 +1939,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     ],
                   ),
                   const SizedBox(height: 12),
-                  Text(statusLine),
+                  Text(status.line),
                   if (!_uploading && _lastSyncAt != null) ...[
                     const SizedBox(height: 8),
                     Text(
@@ -1734,7 +1954,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ),
           const SizedBox(height: 16),
-          if (!_uploading && behind)
+          if (!_uploading && _syncBehind)
             FilledButton.icon(
               onPressed: _syncHealthData,
               icon: const Icon(Icons.cloud_upload),
@@ -1747,7 +1967,9 @@ class _HomeScreenState extends State<HomeScreen> {
           Card(
             child: SwitchListTile(
               title: const Text('Upload automatically'),
-              subtitle: const Text('Sync whenever the app opens'),
+              subtitle: const Text(
+                'Sync in the background and when the app opens',
+              ),
               value: _autoSyncEnabled ?? false,
               onChanged: _uploading ? null : (v) => _setAutoSync(v),
             ),

@@ -37,7 +37,6 @@ dependencies:
   health: ^13.3.1
   http: ^1.6.0
   shared_preferences: ^2.5.5
-  path_provider: ^2.1.5
   google_sign_in: ^7.2.0
   geolocator: ^13.0.1 # only for Geolocator.distanceBetween (route distance math)
   flutter_map: ^7.0.2 # OpenStreetMap-based map for the run detail page

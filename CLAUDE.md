@@ -29,6 +29,8 @@ flutter run --dart-define-from-file=config/dev.json -d <device-id>
 
 `config/dev.json` is per-developer and gitignored; copy `config/dev.json.example` to start. The defaults (when no flag is passed) are `http://10.0.2.2:8000` (the Android emulator's alias for the host's localhost) and an empty Google client ID (Google Sign-In disabled, dev-login still works).
 
+To stamp the build with its source commit (shown on the Debug page as `Build: <hash>`), add `--dart-define=GIT_COMMIT=$(git rev-parse --short HEAD)` to the build/run command — append `-dirty` yourself if the tree isn't clean. Without it the field reads `dev`.
+
 **The shared server runs at `https://xc-server.duckdns.org`** — reachable from any network, valid TLS, no tunnels needed. Use it unless you're developing against a local server.
 
 For a *local* server: from the emulator use `http://10.0.2.2:8000`; from a physical phone either `adb reverse tcp:8000 tcp:8000` + `http://127.0.0.1:8000` (USB) or the host's LAN IP with the server bound to `0.0.0.0`. Local HTTP only works because the Android manifest allows cleartext traffic (`android:usesCleartextTraffic="true"`) and iOS has a dev-only `NSAllowsArbitraryLoads` exception in `ios/Runner/Info.plist` — both can be removed once local HTTP dev is no longer needed.

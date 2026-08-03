@@ -1,6 +1,8 @@
 # Chadwick XC Training App
 
-A Flutter app that uploads **recorded workouts only** — each workout record plus the heart rate, steps, distance, and calories within ±10 minutes of it — to a server for cross country team analysis. Nothing between workouts leaves the phone (no sleep, resting HR, or all-day streams). The client is a thin uploader; analysis happens server-side.
+A Flutter app for a cross country team. It shows an athlete their recent training — weekly mileage, trend, and each run's route and metrics — and uploads **recorded workouts only** to a server for team-wide analysis: each workout record plus the heart rate, steps, distance, and calories within ±10 minutes of it. Nothing between workouts leaves the phone (no sleep, resting HR, or all-day streams).
+
+The training views are computed on-device from the phone's health store, so they work offline. Team-wide analysis happens server-side.
 
 Runs on **Android** (Health Connect) and **iOS** (HealthKit).
 
@@ -36,25 +38,29 @@ xcrun devicectl device process launch --device <udid> com.github.codingwithwarre
 
 ## Current state
 
-Working end-to-end on Android and iOS phones:
+Working end-to-end on Android and iOS phones.
 
-1. Google Sign-In (or dev-login) → server JWT; auto-detects/requests health permissions on launch
-2. Reads workouts (last 24 hours on first sync, incremental afterwards) and the samples around each one
-3. POSTs as `type: "health_sync"` to the configured server (verified accepted)
+**Sign-in and permissions** — Google Sign-In (or dev-login) → server JWT; health permissions are auto-detected and requested on launch, with guided onboarding (3 steps on Android, 2 on iOS — see [CLAUDE.md](CLAUDE.md)).
 
-The DEBUG ONLY section of the UI also exposes **Discover Workout Data** (dumps last 5 workouts as raw JSON to the `flutter run` console) and **Scan All Data (30d)** (per-type counts and peak-HR-per-day summary) for ad-hoc schema discovery. Both will be removed before shipping.
+**Uploading** — every sync reconciles the last 30 days: it reads the workouts in that window, skips the ones the server already has, and POSTs the rest as `type: "health_sync"` with the samples around each one. Reconciling (rather than syncing forward from a watermark) means a workout that arrives with a backdated timestamp — a Garmin activity that syncs days late — still gets picked up. The server is the source of truth for what's been uploaded: `GET /me/last-sample-time` returning null drops the local record and re-reconciles the whole window.
+
+**Background sync** — runs unattended when "Upload automatically" is on: WorkManager on Android (~15 min cadence), `BGAppRefreshTask` plus a HealthKit workout observer on iOS. Both wake a headless Dart isolate that runs the same `SyncService` as the foreground app.
+
+**Training views** — a Training tab (this week's run miles / runs / time, the change vs last week, a four-week mileage chart, recent activity) and a Runs tab listing each workout with distance, duration, and pace. Tapping a run shows its GPS route on a map plus its metrics. All computed on-device, so they work offline.
 
 ## Roadmap
 
 Still open:
 
-1. Background sync via WorkManager (currently syncs on app open)
-2. iOS: TestFlight / App Store distribution (needs the paid Apple Developer Program)
-3. Remove the debug-only UI section (already hidden in release builds)
-4. Drop the local-dev cleartext exceptions (`usesCleartextTraffic` on Android, `NSAllowsArbitraryLoads` on iOS) once local-HTTP development is no longer needed
+1. Server-backed views — season history and team/coach features (leaderboard, roster, assigned workouts) need new server endpoints
+2. Run detail depth — per-mile splits, HR-zone breakdown, pace-colored route
+3. iOS: TestFlight / App Store distribution (needs the paid Apple Developer Program)
+4. Remove the debug-only UI section (already hidden in release builds)
+5. Drop the local-dev cleartext exceptions (`usesCleartextTraffic` on Android, `NSAllowsArbitraryLoads` on iOS) once local-HTTP development is no longer needed
 
 Already shipped (was on the roadmap):
 
+- **Background sync** — WorkManager on Android, BGTask + HealthKit background delivery on iOS; both gated on the automatic-upload toggle.
 - **Multi-athlete** — Google Sign-In → server JWT; the server keys all data to the athlete in the token and ignores the payload's `athlete_id`. Any number of athletes can sign in.
 - **HTTPS** — the shared server runs behind valid TLS at `https://xc-server.duckdns.org`.
 - **GPS routes** — read from Health Connect via a native route-consent flow (see [CLAUDE.md](CLAUDE.md)), so the planned Strava OAuth path isn't needed.
@@ -62,6 +68,10 @@ Already shipped (was on the roadmap):
 
 ## Where things live
 
-- [lib/main.dart](lib/main.dart) — the whole app
+- [lib/main.dart](lib/main.dart) — UI: onboarding, the Training / Runs / Settings tabs, the run detail page, and the debug tools
+- [lib/sync_service.dart](lib/sync_service.dart) — the sync engine, free of any UI. Shared by the app and the background isolates
+- [lib/background_sync.dart](lib/background_sync.dart) — headless entrypoints and scheduling for Android and iOS background sync
+- [lib/auth_service.dart](lib/auth_service.dart) — Google / dev sign-in and JWT persistence
+- [lib/training_week.dart](lib/training_week.dart) — weekly mileage bucketing and the chart (unit tested in [test/](test/))
 - [docs/SERVER_SCHEMA.md](docs/SERVER_SCHEMA.md) — upload contract: payload shape, dedup strategy, suggested Postgres tables, session-detection algorithm
 - [CLAUDE.md](CLAUDE.md) — coding conventions, server/auth config, and Android/Health Connect + iOS/HealthKit gotchas

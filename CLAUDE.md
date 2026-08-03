@@ -9,8 +9,33 @@ This file covers things that aren't obvious from reading the code.
 - Flutter 3.44, Dart 3.x
 - `health` ^13.3.1 (Health Connect on Android, HealthKit on iOS)
 - `http` ^1.6.0
-- `shared_preferences` ^2.5.5 (auth token and onboarding state only — sync state lives on the server: sample watermark via `GET /me/last-sample-time`, route dedup via `GET /routes`)
+- `shared_preferences` ^2.5.5 — auth token, onboarding state, the automatic-upload toggle, the set of workout UUIDs already uploaded, and the last background-sync outcome. The **server** stays the source of truth for what's been uploaded (`GET /me/last-sample-time`; route dedup via `GET /routes`) — the local UUID set is a cache that's dropped whenever the server reports no data.
+- `workmanager` ^0.9.0 — Android periodic background sync (iOS uses native BGTasks instead)
+- `flutter_map` ^7.0.2 + `latlong2` — OpenStreetMap route rendering on the run detail page
+- `geolocator` — only for `Geolocator.distanceBetween` (route distance math)
 - Kotlin on Android, Swift on iOS, minSdk 28
+
+## App structure
+
+- `lib/main.dart` — all UI: onboarding, the Training / Runs / Settings tabs, run detail, debug tools
+- `lib/sync_service.dart` — the sync engine. **No widgets or BuildContext**, because background isolates run it too; progress comes back through an `onProgress` callback and a `SyncResult`
+- `lib/background_sync.dart` — headless entrypoints + scheduling (see below)
+- `lib/auth_service.dart` — sign-in and JWT persistence
+- `lib/training_week.dart` — weekly mileage bucketing and chart, deliberately free of `health` types so it unit tests without a device
+
+## Background sync
+
+Both platforms wake a **headless Dart isolate** — no widgets, no `BuildContext` — that runs `runBackgroundSyncBody()`, which shares `SyncService` with the foreground app so the two can't drift. Both are gated on the same automatic-upload toggle (`autoSyncPrefsKey`) the user sets during onboarding.
+
+- **Android:** `Workmanager().initialize(workManagerCallbackDispatcher)` in `main()` (Android only), then `registerPeriodicTask`. **15 minutes is WorkManager's floor** — the actual cadence is longer and OEM-dependent. Verify scheduling with `adb shell dumpsys jobscheduler | grep -A5 xctraining`; note that force-running via `cmd jobscheduler run` fails on some Pixels, which is a device limitation, not an app bug.
+- **iOS:** `AppDelegate.swift` registers a `BGAppRefreshTask` *and* a HealthKit workout observer (immediate wake when a workout is saved). iOS grants the refresh task on its own schedule — typically hours. The Dart side must report back over the `xctraining/background_sync` channel before iOS's ~30s budget expires.
+
+Two things that bite:
+
+- **`DartPluginRegistrant.ensureInitialized()` is required** in every headless entrypoint, or the `health` / `shared_preferences` channels silently do nothing.
+- **`prefs.reload()` before reading anything a background isolate wrote.** `SharedPreferences` caches in-process, so the UI isolate won't see out-of-process writes without it — this is why "Last Background Sync" once showed "never" right after a sync that had demonstrably succeeded.
+
+Background runs are otherwise invisible, so every attempt records its outcome to `lastBackgroundSyncPrefsKey` for the debug page to display.
 
 ## Coding conventions
 
